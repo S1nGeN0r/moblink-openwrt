@@ -1,0 +1,27 @@
+{
+	"luci-app-moblink": {
+		"description": "Grant access to Moblink configuration",
+		"read": {
+			"file": {
+				"/tmp/moblink-relay-status": [ "list" ],
+				"/tmp/moblink-relay-status/": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "list", "read" ],
+				"network.interface": [
+					"dump"
+				]
+			},
+			"uci": [
+				"moblink-streamer",
+				"moblink-relay-service"
+			]
+		},
+		"write": {
+			"uci": [
+				"moblink-streamer",
+				"moblink-relay-service"
+			]
+		}
+	}
+}

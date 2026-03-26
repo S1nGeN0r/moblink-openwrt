@@ -1,0 +1,7 @@
+build/
+dl/
+staging_dir/
+tmp/
+bin/
+*.ipk
+sdk/
