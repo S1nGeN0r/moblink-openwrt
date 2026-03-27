@@ -1,0 +1,69 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/sbin/moblink-streamer
+CONFIG_FILE=moblink-streamer
+
+append_flag_if_set() {
+	local section="$1"
+	local option="$2"
+	local flag="$3"
+	local value
+
+	config_get_bool value "$section" "$option" 0
+	[ "$value" -eq 1 ] && procd_append_param command "$flag"
+}
+
+append_option_if_set() {
+	local section="$1"
+	local option="$2"
+	local flag="$3"
+	local value
+
+	config_get value "$section" "$option" ""
+	[ -n "$value" ] && procd_append_param command "$flag" "$value"
+}
+
+start_instance() {
+	local section="$1"
+	local enabled password websocket_server_address websocket_server_port
+	local tun_ip_network log_level
+
+	config_get_bool enabled "$section" enabled 0
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get password "$section" password "1234"
+	config_get websocket_server_address "$section" websocket_server_address "0.0.0.0"
+	config_get websocket_server_port "$section" websocket_server_port "7777"
+	config_get tun_ip_network "$section" tun_ip_network "10.3.3.0/24"
+	config_get log_level "$section" log_level "info"
+
+	procd_open_instance
+	procd_set_param command "$PROG"
+	procd_append_param command --password "$password"
+	procd_append_param command --websocket-server-address "$websocket_server_address"
+	procd_append_param command --websocket-server-port "$websocket_server_port"
+	procd_append_param command --tun-ip-network "$tun_ip_network"
+	procd_append_param command --log-level "$log_level"
+	append_flag_if_set "$section" no_log_timestamps --no-log-timestamps
+	append_option_if_set "$section" id --id
+	append_option_if_set "$section" name --name
+	append_option_if_set "$section" destination_address --destination-address
+	append_option_if_set "$section" destination_port --destination-port
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	config_load "$CONFIG_FILE"
+	config_foreach start_instance service
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG_FILE"
+}

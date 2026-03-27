@@ -1,0 +1,425 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+PROG=/usr/sbin/moblink-relay-service
+STATUS_SYNC_PROG=/usr/sbin/moblink-relay-status-sync
+AUTOSCAN_PROG=/usr/sbin/moblink-relay-autoscan
+CONFIG_FILE=moblink-relay-service
+
+GLOBAL_ENABLED=0
+GLOBAL_AUTO_CREATE_RELAYS=1
+GLOBAL_EXCLUDE_VPN_UPLINKS=0
+GLOBAL_DEFAULT_PASSWORD=1234
+GLOBAL_LOG_LEVEL=info
+GLOBAL_NO_LOG_TIMESTAMPS=1
+GLOBAL_STATUS_EXECUTABLE=
+GLOBAL_STATUS_FILE=
+SYNC_CHANGED=0
+ACTIVE_INTERFACES=" "
+
+append_flag_if_true() {
+	local value="$1"
+	local flag="$2"
+
+	[ "$value" = "1" ] && procd_append_param command "$flag"
+}
+
+append_value_if_set() {
+	local value="$1"
+	local flag="$2"
+
+	[ -n "$value" ] && procd_append_param command "$flag" "$value"
+}
+
+append_global_ignore_pattern() {
+	local pattern="$1"
+
+	append_value_if_set "$pattern" --network-interfaces-to-ignore
+}
+
+is_vpn_uplink() {
+	local device="$1"
+	local proto="$2"
+
+	case "$proto" in
+		wg*|wireguard|*vpn*|tailscale)
+			return 0
+		;;
+	esac
+
+	case "$device" in
+		wg*|tun*|tap*|tailscale*|zt*)
+			return 0
+		;;
+	esac
+
+	return 1
+}
+
+sanitize_name() {
+	printf '%s' "$1" | sed 's/[^A-Za-z0-9_]/_/g'
+}
+
+relay_section_name() {
+	printf 'relay_%s' "$(sanitize_name "$1")"
+}
+
+default_database_path() {
+	printf '/etc/moblink-relay-%s.json' "$(sanitize_name "$1")"
+}
+
+default_runtime_status_path() {
+	printf '/tmp/moblink-relay-status/%s.json' "$(sanitize_name "$1")"
+}
+
+mark_changed() {
+	SYNC_CHANGED=1
+}
+
+uci_set_if_changed() {
+	local key="$1"
+	local value="$2"
+	local current
+
+	current="$(uci -q get "$key" 2>/dev/null)"
+	if [ "$current" != "$value" ]; then
+		uci -q set "$key=$value"
+		mark_changed
+	fi
+}
+
+get_label_for_interface() {
+	local device="$1"
+	local networks="$2"
+	local proto="$3"
+	local label=""
+
+	if [ -n "$networks" ]; then
+		label="$networks"
+	fi
+
+	case "$proto" in
+		""|dhcp|dhcpv6|static)
+			:
+		;;
+		*)
+			if [ -n "$label" ]; then
+				label="$label; $proto"
+			else
+				label="$proto"
+			fi
+		;;
+	esac
+
+	if [ -n "$label" ]; then
+		printf '%s (%s)' "$device" "$label"
+	else
+		printf '%s' "$device"
+	fi
+}
+
+ensure_relay_section() {
+	local device="$1"
+	local detected_label="$2"
+	local section
+
+	section="$(relay_section_name "$device")"
+
+	uci_set_if_changed "$CONFIG_FILE.$section" relay
+	uci_set_if_changed "$CONFIG_FILE.$section.interface" "$device"
+	uci_set_if_changed "$CONFIG_FILE.$section.auto_created" "1"
+	uci_set_if_changed "$CONFIG_FILE.$section.detected_label" "$detected_label"
+	uci_set_if_changed "$CONFIG_FILE.$section.active" "1"
+	uci_set_if_changed "$CONFIG_FILE.$section.last_seen" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+	if [ -z "$(uci -q get "$CONFIG_FILE.$section.enabled" 2>/dev/null)" ]; then
+		uci -q set "$CONFIG_FILE.$section.enabled=1"
+		mark_changed
+	fi
+
+	if [ -z "$(uci -q get "$CONFIG_FILE.$section.password" 2>/dev/null)" ]; then
+		uci -q set "$CONFIG_FILE.$section.password=$GLOBAL_DEFAULT_PASSWORD"
+		mark_changed
+	fi
+
+	if [ -z "$(uci -q get "$CONFIG_FILE.$section.database" 2>/dev/null)" ]; then
+		uci -q set "$CONFIG_FILE.$section.database=$(default_database_path "$device")"
+		mark_changed
+	fi
+
+	ACTIVE_INTERFACES="${ACTIVE_INTERFACES}${device} "
+}
+
+process_detected_uplinks() {
+	local dump keys key up l3_device proto routes route_key target mask has_default name networks detected_label
+
+	dump="$(ubus call network.interface dump 2>/dev/null)" || return 0
+	json_load "$dump" || return 0
+	json_select interface || return 0
+	json_get_keys keys
+
+	for key in $keys; do
+		json_select "$key"
+		json_get_var up up
+
+		if [ "$up" != "1" ] && [ "$up" != "true" ]; then
+			json_select ..
+			continue
+		fi
+
+		json_get_var l3_device l3_device
+		[ -n "$l3_device" ] || json_get_var l3_device device
+		json_get_var proto proto
+		json_get_var name interface
+		[ -n "$name" ] || name="$key"
+
+		if [ -z "$l3_device" ] || [ "$l3_device" = "lo" ]; then
+			json_select ..
+			continue
+		fi
+
+		if [ "$GLOBAL_EXCLUDE_VPN_UPLINKS" -eq 1 ] && is_vpn_uplink "$l3_device" "$proto"; then
+			json_select ..
+			continue
+		fi
+
+		has_default=0
+		if json_select route 2>/dev/null; then
+			json_get_keys routes
+			for route_key in $routes; do
+				json_select "$route_key"
+				json_get_var target target
+				json_get_var mask mask
+
+				if { [ "$target" = "0.0.0.0" ] || [ "$target" = "::" ]; } && [ "$mask" = "0" ]; then
+					has_default=1
+				fi
+
+				json_select ..
+				[ "$has_default" -eq 1 ] && break
+			done
+			json_select ..
+		fi
+
+		if [ "$has_default" -eq 1 ]; then
+			networks="$name"
+			detected_label="$(get_label_for_interface "$l3_device" "$networks" "$proto")"
+			ensure_relay_section "$l3_device" "$detected_label"
+		fi
+
+		json_select ..
+	done
+}
+
+mark_missing_relays_inactive() {
+	local section="$1"
+	local device auto_created
+
+	config_get device "$section" interface ""
+	config_get auto_created "$section" auto_created "0"
+
+	[ -n "$device" ] || return 0
+	[ "$auto_created" = "1" ] || return 0
+
+	case "$ACTIVE_INTERFACES" in
+		*" $device "*) uci_set_if_changed "$CONFIG_FILE.$section.active" "1" ;;
+		*)
+			uci_set_if_changed "$CONFIG_FILE.$section.active" "0"
+			uci_set_if_changed "$CONFIG_FILE.$section.connection_status" "inactive"
+			uci_set_if_changed "$CONFIG_FILE.$section.streamer_ip" ""
+		;;
+	esac
+}
+
+load_globals() {
+	config_get_bool GLOBAL_ENABLED globals enabled 0
+	config_get_bool GLOBAL_AUTO_CREATE_RELAYS globals auto_create_relays 1
+	config_get_bool GLOBAL_EXCLUDE_VPN_UPLINKS globals exclude_vpn_uplinks 0
+	config_get GLOBAL_DEFAULT_PASSWORD globals default_password "1234"
+	config_get GLOBAL_LOG_LEVEL globals log_level "info"
+	config_get_bool GLOBAL_NO_LOG_TIMESTAMPS globals no_log_timestamps 1
+	config_get GLOBAL_STATUS_EXECUTABLE globals status_executable ""
+	config_get GLOBAL_STATUS_FILE globals status_file ""
+}
+
+parse_legacy_override() {
+	local value="$1"
+	local interface="${value%%=*}"
+	local label="${value#*=}"
+
+	[ -n "$interface" ] || return 0
+	[ "$interface" != "$label" ] || return 0
+
+	uci -q set "$CONFIG_FILE.$(relay_section_name "$interface").custom_label=$label"
+	mark_changed
+}
+
+create_legacy_relay() {
+	local interface="$1"
+	local section
+
+	[ -n "$interface" ] || return 0
+	section="$(relay_section_name "$interface")"
+	uci -q set "$CONFIG_FILE.$section=relay"
+	uci -q set "$CONFIG_FILE.$section.enabled=1"
+	uci -q set "$CONFIG_FILE.$section.auto_created=1"
+	uci -q set "$CONFIG_FILE.$section.interface=$interface"
+	uci -q set "$CONFIG_FILE.$section.database=$(default_database_path "$interface")"
+	uci -q set "$CONFIG_FILE.$section.active=1"
+	uci -q set "$CONFIG_FILE.$section.last_seen=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	uci -q set "$CONFIG_FILE.$section.password=$LEGACY_PASSWORD"
+	mark_changed
+}
+
+migrate_legacy_config() {
+	local globals_exists legacy_type legacy_enabled legacy_log_level legacy_database
+
+	globals_exists="$(uci -q get "$CONFIG_FILE.globals" 2>/dev/null)"
+	legacy_type="$(uci -q get "$CONFIG_FILE.main" 2>/dev/null)"
+
+	[ -n "$globals_exists" ] && return 0
+	[ "$legacy_type" = "service" ] || return 0
+
+	config_get_bool legacy_enabled main enabled 0
+	config_get_bool legacy_exclude_vpn main exclude_vpn_uplinks 0
+	config_get legacy_password main password "1234"
+	config_get legacy_log_level main log_level "info"
+	config_get_bool legacy_no_log_timestamps main no_log_timestamps 1
+	config_get legacy_status_executable main status_executable ""
+	config_get legacy_status_file main status_file ""
+
+	LEGACY_PASSWORD="$legacy_password"
+
+	uci -q set "$CONFIG_FILE.globals=globals"
+	uci -q set "$CONFIG_FILE.globals.enabled=$legacy_enabled"
+	uci -q set "$CONFIG_FILE.globals.auto_create_relays=1"
+	uci -q set "$CONFIG_FILE.globals.exclude_vpn_uplinks=$legacy_exclude_vpn"
+	uci -q set "$CONFIG_FILE.globals.show_inactive_relays=0"
+	uci -q set "$CONFIG_FILE.globals.default_password=$legacy_password"
+	uci -q set "$CONFIG_FILE.globals.log_level=$legacy_log_level"
+	uci -q set "$CONFIG_FILE.globals.no_log_timestamps=$legacy_no_log_timestamps"
+	uci -q set "$CONFIG_FILE.globals.status_executable=$legacy_status_executable"
+	uci -q set "$CONFIG_FILE.globals.status_file=$legacy_status_file"
+	mark_changed
+
+	config_list_foreach main allowed_interfaces create_legacy_relay
+	config_list_foreach main interface_label_overrides parse_legacy_override
+
+	if [ -z "$(uci -q show "$CONFIG_FILE" | grep -F '=relay' 2>/dev/null)" ]; then
+		load_globals
+		process_detected_uplinks
+	fi
+
+	if [ "$SYNC_CHANGED" -eq 1 ]; then
+		uci -q commit "$CONFIG_FILE"
+	fi
+}
+
+cleanup_legacy_config() {
+	local globals_exists legacy_type
+
+	globals_exists="$(uci -q get "$CONFIG_FILE.globals" 2>/dev/null)"
+	legacy_type="$(uci -q get "$CONFIG_FILE.main" 2>/dev/null)"
+
+	[ -n "$globals_exists" ] || return 0
+	[ "$legacy_type" = "service" ] || return 0
+
+	uci -q delete "$CONFIG_FILE.main"
+	uci -q commit "$CONFIG_FILE"
+}
+
+sync_auto_relays() {
+	SYNC_CHANGED=0
+	ACTIVE_INTERFACES=" "
+
+	[ "$GLOBAL_AUTO_CREATE_RELAYS" -eq 1 ] && process_detected_uplinks
+	config_foreach mark_missing_relays_inactive relay
+
+	if [ "$SYNC_CHANGED" -eq 1 ]; then
+		uci -q commit "$CONFIG_FILE"
+	fi
+}
+
+start_relay_instance() {
+	local section="$1"
+	local enabled interface password database custom_label detected_label relay_label active streamer_url use_manual_streamer_url runtime_status_file
+
+	[ "$GLOBAL_ENABLED" -eq 1 ] || return 0
+
+	config_get_bool enabled "$section" enabled 1
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get_bool active "$section" active 0
+	[ "$active" -eq 1 ] || return 0
+
+	config_get interface "$section" interface ""
+	[ -n "$interface" ] || return 0
+
+	config_get password "$section" password "$GLOBAL_DEFAULT_PASSWORD"
+	config_get database "$section" database "$(default_database_path "$interface")"
+	config_get custom_label "$section" custom_label ""
+	config_get detected_label "$section" detected_label ""
+	config_get streamer_url "$section" streamer_url ""
+	config_get_bool use_manual_streamer_url "$section" use_manual_streamer_url 0
+	runtime_status_file="$(default_runtime_status_path "$section")"
+
+	relay_label="$custom_label"
+	[ -n "$relay_label" ] || relay_label="$detected_label"
+	[ -n "$relay_label" ] || relay_label="$interface"
+
+	procd_open_instance "$section"
+	procd_set_param command "$PROG"
+	procd_append_param command --password "$password"
+	procd_append_param command --log-level "$GLOBAL_LOG_LEVEL"
+	procd_append_param command --database "$database"
+	procd_append_param command --runtime-status-file "$runtime_status_file"
+	append_flag_if_true "$GLOBAL_NO_LOG_TIMESTAMPS" --no-log-timestamps
+	append_value_if_set "$GLOBAL_STATUS_EXECUTABLE" --status-executable
+	append_value_if_set "$GLOBAL_STATUS_FILE" --status-file
+	if [ "$use_manual_streamer_url" -eq 1 ]; then
+		append_value_if_set "$streamer_url" --streamer-url
+	fi
+	procd_append_param command --network-interfaces-to-allow "^${interface}$"
+	procd_append_param command --interface-name-override "${interface}=${relay_label}"
+	config_list_foreach globals network_interfaces_to_ignore append_global_ignore_pattern
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	config_load "$CONFIG_FILE"
+	migrate_legacy_config
+	cleanup_legacy_config
+	config_load "$CONFIG_FILE"
+	load_globals
+	sync_auto_relays
+	config_load "$CONFIG_FILE"
+	load_globals
+	config_foreach start_relay_instance relay
+
+	procd_open_instance status-sync
+	procd_set_param command "$STATUS_SYNC_PROG" "$CONFIG_FILE" "1"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance autoscan
+	procd_set_param command "$AUTOSCAN_PROG" "$CONFIG_FILE" "2"
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG_FILE"
+}
