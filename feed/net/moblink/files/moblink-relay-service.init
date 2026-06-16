@@ -385,7 +385,7 @@ start_relay_instance() {
 	if [ "$use_manual_streamer_url" -eq 1 ]; then
 		append_value_if_set "$streamer_url" --streamer-url
 	fi
-	procd_append_param command --network-interfaces-to-allow "^${interface}$"
+	procd_append_param command --network-interfaces-to-allow "$interface"
 	procd_append_param command --interface-name-override "${interface}=${relay_label}"
 	config_list_foreach globals network_interfaces_to_ignore append_global_ignore_pattern
 	procd_set_param respawn
