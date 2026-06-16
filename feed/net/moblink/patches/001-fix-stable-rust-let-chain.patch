@@ -1,0 +1,24 @@
+diff --git a/src/utils.rs b/src/utils.rs
+index a9a0b02..0c5c54d 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -67,15 +67,15 @@ pub fn get_first_ipv4_address(interface: &NetworkInterface) -> Option<Ipv4Addr>
+ pub fn any_address_belongs_to_this_machine(addresses: &HashSet<Ipv4Addr>) -> bool {
+     let Ok(interfaces) = NetworkInterface::show() else {
+         return true;
+     };
+     for interface in interfaces {
+         for addr in interface.addr {
+-            if let Addr::V4(addr) = addr
+-                && addresses.contains(&addr.ip)
+-            {
+-                return true;
++            if let Addr::V4(addr) = addr {
++                if addresses.contains(&addr.ip) {
++                    return true;
++                }
+             }
+         }
+     }
+     false
+ }

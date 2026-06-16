@@ -13,6 +13,39 @@ Originally, the router work here grew out of adapting the Moblink Rust code to
 OpenWrt, LuCI, and the practical reality that routers tend to have more than one
 way to get online.
 
+## Current Upstream Base
+
+This feed currently builds upstream `moblink-rust` `0.9.7` from commit:
+
+```text
+a77d42c34cff65156a44617af34fad4e7592ea64
+```
+
+The OpenWrt integration no longer carries a local fork of the upstream relay
+service source. OpenWrt-specific behavior lives in package metadata, init
+scripts, UCI defaults, small compatibility patches, and LuCI views.
+
+The remaining patch under `feed/net/moblink/patches/` avoids Rust let-chain
+syntax that is rejected by the OpenWrt 23.05 Rust toolchain used for package
+builds.
+
+## Why a Router?
+
+A router is a natural place to run Moblink because it can keep multiple uplinks
+connected at the same time and expose them as independent relay paths.
+
+Useful uplinks can include:
+
+- Ethernet WAN
+- Wi-Fi as WAN
+- USB tethering
+- LTE modems
+- 5G modems
+- VPN or other backup links
+
+This is especially handy with LTE and 5G modems that can use external antennas
+for better placement and signal quality.
+
 ## Features
 
 - OpenWrt packages for `moblink-relay-service`
@@ -41,6 +74,7 @@ relay per usable uplink:
 
 - Ethernet WAN
 - Wi-Fi WAN
+- LTE / 5G modem uplinks
 - WireGuard uplink
 - USB tethering
 - cellular / WWAN uplink

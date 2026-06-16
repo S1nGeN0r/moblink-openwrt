@@ -6,8 +6,8 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/datagutt/moblink-rust.git
-PKG_SOURCE_VERSION:=c84cfc94a2e51df66a67e19757d860458bf332d7
-PKG_SOURCE_DATE:=2025-06-01
+PKG_SOURCE_VERSION:=a77d42c34cff65156a44617af34fad4e7592ea64
+PKG_SOURCE_DATE:=2026-05-26
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(PKG_SOURCE_DATE)-$(PKG_SOURCE_VERSION).tar.xz
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
 PKG_MIRROR_HASH:=skip
@@ -22,11 +22,6 @@ MOBLINK_ROUTER_ARCH:=aarch64_cortex-a53_neon-vfpv4
 
 include $(INCLUDE_DIR)/package.mk
 include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk
-
-define Build/Prepare
-	$(call Build/Prepare/Default)
-	$(CP) ./src/. $(PKG_BUILD_DIR)/src/
-endef
 
 define Package/moblink-relay-service
   SECTION:=net
