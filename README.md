@@ -1,176 +1,149 @@
 # Moblink for OpenWrt
 
-Moblink, router edition.
+OpenWrt feed for running Moblink on routers, with packages for the upstream
+Rust services and a LuCI interface for day-to-day configuration.
 
-Use your OpenWrt router as a multi-uplink Moblink relay with a LuCI interface,
-separate relay instances per interface, and packageable `.ipk` builds.
-
-Built on top of:
-
-- [`datagutt/moblink-rust`](https://github.com/datagutt/moblink-rust)
-
-Originally, the router work here grew out of adapting the Moblink Rust code to
-OpenWrt, LuCI, and the practical reality that routers tend to have more than one
-way to get online.
-
-## Current Upstream Base
-
-This feed currently builds upstream `moblink-rust` `0.9.7` from commit:
+This feed builds upstream [`datagutt/moblink-rust`](https://github.com/datagutt/moblink-rust)
+`0.9.7` from commit:
 
 ```text
 a77d42c34cff65156a44617af34fad4e7592ea64
 ```
 
-The OpenWrt integration no longer carries a local fork of the upstream relay
-service source. OpenWrt-specific behavior lives in package metadata, init
-scripts, UCI defaults, small compatibility patches, and LuCI views.
+The feed does not carry a local Rust relay-service fork. OpenWrt integration
+lives in package metadata, init scripts, UCI defaults, LuCI views, and a small
+compatibility patch for OpenWrt toolchains.
 
-The remaining patch under `feed/net/moblink/patches/` avoids Rust let-chain
-syntax that is rejected by the OpenWrt 23.05 Rust toolchain used for package
-builds.
+## Packages
 
-## Why a Router?
+- `moblink-relay-service`: starts one relay process per enabled uplink.
+- `moblink-streamer`: streamer service package for OpenWrt.
+- `luci-app-moblink`: LuCI UI for streamer and relay settings.
 
-A router is a natural place to run Moblink because it can keep multiple uplinks
-connected at the same time and expose them as independent relay paths.
+## Supported Targets
 
-Useful uplinks can include:
+The current tested package builds are:
 
-- Ethernet WAN
-- Wi-Fi as WAN
-- USB tethering
-- LTE modems
-- 5G modems
-- VPN or other backup links
+- GL.iNet GL-AXT1800 on OpenWrt 23.05 / GL.iNet 4.x firmware:
+  `aarch64_cortex-a53_neon-vfpv4` IPK packages.
+- Cudy TR3000 256MB on OpenWrt 25 / apk-based builds:
+  `mediatek/filogic` APK packages.
 
-This is especially handy with LTE and 5G modems that can use external antennas
-for better placement and signal quality.
+Other OpenWrt targets should be buildable through the matching OpenWrt SDK, but
+they are not release-tested yet.
 
-## Features
+## Relay Behavior
 
-- OpenWrt packages for `moblink-relay-service`
-- OpenWrt packages for `moblink-streamer`
-- LuCI UI for relay and streamer management
-- one relay instance per uplink interface
-- separate identity database per relay
-- custom relay labels visible in the Moblin app
-- automatic uplink detection
-- automatic streamer discovery
-- optional manual streamer URL mode
-- connection status and streamer IP visible in LuCI
+The relay package can auto-create one relay section per eligible uplink
+interface. Runtime state is stored under `/tmp`, while UCI is kept for user
+configuration. Interface changes are handled through OpenWrt hotplug events, and
+a small watchdog supervises relay health without forking upstream Rust code.
 
-## Tested On
+Relay interface allow filters pass plain interface names to upstream Moblink.
+The upstream service handles anchoring; the OpenWrt init script does not add
+extra regex anchors.
 
-- `GL.iNet GL-AXT1800`
-- `OpenWrt 23.05-SNAPSHOT`
-- `Target: qualcommax/ipq60xx`
+## Install Prebuilt Packages
 
-## How It Works
+Download the matching release assets for your target and copy them to the
+router.
 
-The relay side is intentionally multi-interface.
+For IPK-based OpenWrt:
 
-Instead of one big relay process trying to do everything, the router creates one
-relay per usable uplink:
+```sh
+opkg install --force-reinstall ./*.ipk
+/etc/init.d/rpcd restart
+/etc/init.d/uhttpd restart
+```
 
-- Ethernet WAN
-- Wi-Fi WAN
-- LTE / 5G modem uplinks
-- WireGuard uplink
-- USB tethering
-- cellular / WWAN uplink
-- other backup links
+For APK-based OpenWrt:
 
-That means the router can expose several independent paths at once, while the
-Moblin app handles priority and bonding on its side.
+```sh
+apk add --allow-untrusted --force-reinstall ./*.apk
+/etc/init.d/rpcd restart
+/etc/init.d/uhttpd restart
+```
 
-In practice, the configuration model is:
-
-- one `globals` section
-- one `relay_*` section per interface
-- one relay process per interface
-- one database file per relay identity
-
-## Requirements
-
-For package builds:
-
-- OpenWrt source tree or OpenWrt SDK
-- Rust support in the OpenWrt build environment
-- Cargo via the OpenWrt Rust packaging flow
-
-For runtime:
-
-- OpenWrt router
-- LuCI if you want the web UI
-- at least one active uplink interface
-
-## Usage
-
-### Relay Manager
-
-Install:
-
-- `moblink-relay-service`
-- `luci-app-moblink`
-
-Then open:
-
-- `Moblink -> Relay Service`
-
-Typical flow:
-
-1. Enable the relay manager
-2. Let it auto-create relays for active uplinks
-3. Rename relay labels if you want nicer names in the Moblin app
-4. Keep streamer discovery on automatic, or set a manual streamer URL
-5. Watch connection state and streamer IP directly in LuCI
-
-### Streamer
-
-If the router should also run the streamer side, install:
-
-- `moblink-streamer`
-
-Then configure it from:
-
-- `Moblink -> Streamer`
-
-## Build
-
-Add this repository to `feeds.conf`:
+The LuCI pages are available under:
 
 ```text
-src-git moblink https://github.com/S1nGeN0r/moblink-openwrt.git
+Services -> Moblink
 ```
 
-Update and install the feed:
+## Build With OpenWrt SDK
 
-```bash
-./scripts/feeds update moblink
-./scripts/feeds install -a -p moblink
+Use the SDK that matches your router target and OpenWrt version.
+
+1. Add this repository as a feed:
+
+   ```sh
+   echo "src-git moblink https://github.com/S1nGeN0r/moblink-openwrt.git" >> feeds.conf.default
+   ./scripts/feeds update moblink
+   ./scripts/feeds install -p moblink -a
+   ```
+
+2. Select the packages:
+
+   ```sh
+   make menuconfig
+   ```
+
+   Enable:
+
+   ```text
+   Network -> moblink-relay-service
+   Network -> moblink-streamer
+   LuCI -> Applications -> luci-app-moblink
+   ```
+
+3. Build the packages:
+
+   ```sh
+   make package/feeds/moblink/moblink/compile V=s
+   make package/feeds/moblink/luci-app-moblink/compile V=s
+   ```
+
+Artifacts are written under `bin/packages/` for package builds and, depending on
+the SDK, may also appear under `bin/targets/`.
+
+### GL-AXT1800 Note
+
+Some GL.iNet firmware builds expect packages marked as
+`aarch64_cortex-a53_neon-vfpv4`. If you are building specifically for that
+environment, pass:
+
+```sh
+MOBLINK_PKGARCH=aarch64_cortex-a53_neon-vfpv4 \
+MOBLINK_LUCI_PKGARCH=aarch64_cortex-a53_neon-vfpv4 \
+make package/feeds/moblink/moblink/compile package/feeds/moblink/luci-app-moblink/compile V=s
 ```
 
-Select packages in `menuconfig`:
+For normal OpenWrt SDK builds, leave `MOBLINK_PKGARCH` unset so buildroot uses
+the target package architecture.
 
-- `Network -> moblink-relay-service`
-- `Network -> moblink-streamer`
-- `LuCI -> Applications -> luci-app-moblink`
+## Configuration
 
-Build specific packages:
+The relay manager config is stored in:
 
-```bash
-make package/feeds/moblink/moblink-relay-service/compile V=s
-make package/feeds/moblink/moblink-streamer/compile V=s
-make package/feeds/moblink/luci-app-moblink/compile V=s
+```text
+/etc/config/moblink-relay-service
 ```
 
-Or build from the full OpenWrt tree:
+The streamer config is stored in:
 
-```bash
-make -j$(nproc) V=s
+```text
+/etc/config/moblink-streamer
 ```
 
-The output packages are standard OpenWrt `.ipk` files.
+After changing config outside LuCI, restart the relevant service:
+
+```sh
+/etc/init.d/moblink-relay-service restart
+/etc/init.d/moblink-streamer restart
+```
+
+The output packages are standard OpenWrt `.ipk` files on opkg-based releases
+and `.apk` files on apk-based OpenWrt releases.
 
 ## LuCI
 

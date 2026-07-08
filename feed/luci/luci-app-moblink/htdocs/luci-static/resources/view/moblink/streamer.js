@@ -26,7 +26,6 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'name', _('Name'));
-		o.placeholder = 'OpenWrt Streamer';
 
 		o = s.option(form.Value, 'id', _('ID'));
 		o.placeholder = 'optional';
@@ -49,7 +48,6 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'destination_address', _('Destination address'));
-		o.placeholder = '192.168.1.10';
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'destination_port', _('Destination port'));

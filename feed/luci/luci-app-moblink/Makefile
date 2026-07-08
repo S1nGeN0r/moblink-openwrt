@@ -2,10 +2,10 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-moblink
 PKG_RELEASE:=1
-MOBLINK_ROUTER_ARCH:=aarch64_cortex-a53_neon-vfpv4
 
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=Daniel
+MOBLINK_LUCI_PKGARCH?=all
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -14,7 +14,7 @@ define Package/luci-app-moblink
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=LuCI support for Moblink
-  PKGARCH:=$(MOBLINK_ROUTER_ARCH)
+  PKGARCH:=$(MOBLINK_LUCI_PKGARCH)
   DEPENDS:=+luci-base +moblink-relay-service +moblink-streamer
 endef
 
@@ -32,7 +32,7 @@ define Package/luci-app-moblink/install
 	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-moblink.json $(1)/usr/share/luci/menu.d/
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/moblink
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/moblink/streamer.js $(1)/www/luci-static/resources/view/moblink/
-	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/moblink/relay-manager-v3.js $(1)/www/luci-static/resources/view/moblink/
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/moblink/relay-manager.js $(1)/www/luci-static/resources/view/moblink/
 endef
 
 $(eval $(call BuildPackage,luci-app-moblink))

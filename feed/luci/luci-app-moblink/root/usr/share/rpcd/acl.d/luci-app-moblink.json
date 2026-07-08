@@ -3,8 +3,10 @@
 		"description": "Grant access to Moblink configuration",
 		"read": {
 			"file": {
+				"/proc/net/ip_conntrack": [ "read" ],
+				"/proc/net/nf_conntrack": [ "read" ],
 				"/tmp/moblink-relay-status": [ "list" ],
-				"/tmp/moblink-relay-status/": [ "read" ]
+				"/tmp/moblink-relay-status/*.json": [ "read" ]
 			},
 			"ubus": {
 				"file": [ "list", "read" ],

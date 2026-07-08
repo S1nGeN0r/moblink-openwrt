@@ -1,0 +1,30 @@
+#!/bin/sh
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || exit 0
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+. /usr/share/moblink/relay-common.sh
+
+CONFIG_FILE=moblink-relay-service
+GLOBAL_AUTO_CREATE_RELAYS=1
+GLOBAL_EXCLUDE_VPN_UPLINKS=0
+GLOBAL_DEFAULT_PASSWORD=1234
+SYNC_CHANGED=0
+ACTIVE_INTERFACES=" "
+
+load_globals() {
+	config_get_bool GLOBAL_AUTO_CREATE_RELAYS globals auto_create_relays 1
+	config_get_bool GLOBAL_EXCLUDE_VPN_UPLINKS globals exclude_vpn_uplinks 0
+	config_get GLOBAL_DEFAULT_PASSWORD globals default_password "1234"
+}
+
+config_load "$CONFIG_FILE"
+load_globals
+process_detected_uplinks
+
+if [ "$SYNC_CHANGED" -eq 1 ]; then
+	uci -q commit "$CONFIG_FILE"
+fi
+
+/etc/init.d/moblink-relay-service reload >/dev/null 2>&1 || true

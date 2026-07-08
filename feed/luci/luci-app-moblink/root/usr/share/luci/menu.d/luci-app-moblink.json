@@ -25,7 +25,7 @@
 		"order": 20,
 		"action": {
 			"type": "view",
-			"path": "moblink/relay-manager-v3"
+			"path": "moblink/relay-manager"
 		},
 		"depends": {
 			"acl": [ "luci-app-moblink" ]
