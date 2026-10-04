@@ -2,6 +2,11 @@
 'require form';
 'require view';
 
+function requireEnabled(option) {
+	option.depends('enabled', '1');
+	option.retain = true;
+}
+
 function addLogLevelOption(section) {
 	var o = section.option(form.ListValue, 'log_level', _('Log level'));
 	o.value('error', _('error'));
@@ -10,6 +15,7 @@ function addLogLevelOption(section) {
 	o.value('debug', _('debug'));
 	o.value('trace', _('trace'));
 	o.default = 'info';
+	requireEnabled(o);
 }
 
 return view.extend({
@@ -26,38 +32,48 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'name', _('Name'));
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'id', _('ID'));
 		o.placeholder = 'optional';
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'password', _('Password'));
 		o.password = true;
 		o.rmempty = false;
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'websocket_server_address', _('WebSocket listen address'));
 		o.placeholder = '0.0.0.0';
 		o.rmempty = false;
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'websocket_server_port', _('WebSocket listen port'));
 		o.datatype = 'port';
 		o.placeholder = '7777';
 		o.rmempty = false;
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'tun_ip_network', _('TUN IP network'));
 		o.placeholder = '10.3.3.0/24';
 		o.rmempty = false;
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'destination_address', _('Destination address'));
 		o.rmempty = false;
+		requireEnabled(o);
 
 		o = s.option(form.Value, 'destination_port', _('Destination port'));
 		o.datatype = 'port';
 		o.placeholder = '5000';
+		o.rmempty = false;
+		requireEnabled(o);
 
 		addLogLevelOption(s);
 
 		o = s.option(form.Flag, 'no_log_timestamps', _('Disable log timestamps'));
 		o.default = '1';
+		requireEnabled(o);
 
 		return m.render();
 	}

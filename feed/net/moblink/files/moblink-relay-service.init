@@ -21,7 +21,7 @@ GLOBAL_NO_LOG_TIMESTAMPS=1
 GLOBAL_STATUS_EXECUTABLE=
 GLOBAL_STATUS_FILE=
 SYNC_CHANGED=0
-ACTIVE_INTERFACES=" "
+AVAILABLE_INTERFACES=" "
 
 append_flag_if_true() {
 	local value="$1"
@@ -142,7 +142,7 @@ cleanup_legacy_config() {
 
 sync_auto_relays() {
 	SYNC_CHANGED=0
-	ACTIVE_INTERFACES=" "
+	AVAILABLE_INTERFACES=" "
 
 	process_detected_uplinks
 
@@ -155,26 +155,44 @@ start_relay_instance() {
 	local section="$1"
 	local enabled interface password database custom_label detected_label relay_label streamer_url use_manual_streamer_url runtime_status_file
 
-	[ "$GLOBAL_ENABLED" -eq 1 ] || return 0
+	runtime_status_file="$(default_runtime_status_path "$section")"
+	if [ "$GLOBAL_ENABLED" -ne 1 ]; then
+		rm -f "$runtime_status_file"
+		return 0
+	fi
 
 	config_get_bool enabled "$section" enabled 1
-	[ "$enabled" -eq 1 ] || return 0
+	if [ "$enabled" -ne 1 ]; then
+		rm -f "$runtime_status_file"
+		return 0
+	fi
 
 	config_get interface "$section" interface ""
-	[ -n "$interface" ] || return 0
-
-	case "$ACTIVE_INTERFACES" in
+	if [ -z "$interface" ]; then
+		rm -f "$runtime_status_file"
+		return 0
+	fi
+	case "$AVAILABLE_INTERFACES" in
 		*" $interface "*) ;;
-		*) return 0 ;;
+		*) rm -f "$runtime_status_file"; return 0 ;;
 	esac
 
 	config_get password "$section" password "$GLOBAL_DEFAULT_PASSWORD"
-	config_get database "$section" database "$(default_database_path "$interface")"
+	config_get database "$section" database "$(default_database_path "$section")"
 	config_get custom_label "$section" custom_label ""
 	config_get detected_label "$section" detected_label ""
 	config_get streamer_url "$section" streamer_url ""
 	config_get_bool use_manual_streamer_url "$section" use_manual_streamer_url 0
-	runtime_status_file="$(default_runtime_status_path "$section")"
+	if [ "$use_manual_streamer_url" -eq 1 ]; then
+		case "$streamer_url" in
+			ws://?*) ;;
+			*)
+				logger -t moblink-relay-service "not starting $section: manual streamer URL must use ws://"
+				rm -f "$runtime_status_file"
+				return 0
+				;;
+		esac
+	fi
 
 	relay_label="$custom_label"
 	[ -n "$relay_label" ] || relay_label="$detected_label"
@@ -192,7 +210,7 @@ start_relay_instance() {
 	if [ "$use_manual_streamer_url" -eq 1 ]; then
 		append_value_if_set "$streamer_url" --streamer-url
 	fi
-	procd_append_param command --network-interfaces-to-allow "$interface"
+	procd_append_param command --network-interfaces-to-allow "$(escape_interface_pattern "$interface")"
 	procd_append_param command --interface-name-override "${interface}=${relay_label}"
 	config_list_foreach globals network_interfaces_to_ignore append_global_ignore_pattern
 	procd_set_param respawn 3600 5 0
@@ -214,6 +232,7 @@ start_watchdog_instance() {
 }
 
 start_service() {
+	local file section
 	config_load "$CONFIG_FILE"
 	migrate_legacy_config
 	cleanup_legacy_config
@@ -223,9 +242,19 @@ start_service() {
 	config_load "$CONFIG_FILE"
 	load_globals
 	config_foreach start_relay_instance relay
+	for file in /tmp/moblink-relay-status/*.json; do
+		[ -e "$file" ] || continue
+		section="${file##*/}"
+		section="${section%.json}"
+		[ "$(uci -q get "$CONFIG_FILE.$section")" = relay ] || rm -f "$file"
+	done
 	start_watchdog_instance
 }
 
 service_triggers() {
 	procd_add_reload_trigger "$CONFIG_FILE"
+}
+
+stop_service() {
+	rm -f /tmp/moblink-relay-status/*.json
 }

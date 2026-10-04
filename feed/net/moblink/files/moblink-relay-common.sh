@@ -2,6 +2,10 @@ sanitize_name() {
 	printf '%s' "$1" | sed 's/[^A-Za-z0-9_]/_/g'
 }
 
+escape_interface_pattern() {
+	printf '%s' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'
+}
+
 relay_section_name() {
 	printf 'relay_%s' "$(sanitize_name "$1")"
 }
@@ -35,18 +39,65 @@ is_vpn_uplink() {
 	local proto="$2"
 
 	case "$proto" in
-		wg*|wireguard|*vpn*|tailscale)
+		wg*|wireguard|amneziawg|*vpn*|tailscale)
 			return 0
 		;;
 	esac
 
 	case "$device" in
-		wg*|tun*|tap*|tailscale*|zt*)
+		wg*|awg*|tun*|tap*|tailscale*|zt*)
 			return 0
 		;;
 	esac
 
 	return 1
+}
+
+is_policy_routed_uplink() {
+	local device="$1"
+	local proto="$2"
+
+	case "$proto" in
+		3g|mbim|modemmanager|ncm|ppp|qmi)
+			return 0
+		;;
+	esac
+
+	case "$device" in
+		modem*|ppp*|rmnet*|wwan*|wwp*)
+			return 0
+		;;
+	esac
+
+	return 1
+}
+
+is_ipv4_literal() {
+	local host="$1"
+	local first second third fourth rest octet
+
+	first="${host%%.*}"
+	[ "$first" != "$host" ] || return 1
+	rest="${host#*.}"
+	second="${rest%%.*}"
+	[ "$second" != "$rest" ] || return 1
+	rest="${rest#*.}"
+	third="${rest%%.*}"
+	[ "$third" != "$rest" ] || return 1
+	fourth="${rest#*.}"
+
+	case "$fourth" in
+		*.*) return 1 ;;
+	esac
+
+	for octet in "$first" "$second" "$third" "$fourth"; do
+		case "$octet" in
+			''|*[!0-9]*) return 1 ;;
+		esac
+		[ "${#octet}" -le 3 ] && [ "$octet" -le 255 ] || return 1
+	done
+
+	return 0
 }
 
 get_label_for_interface() {
@@ -85,11 +136,10 @@ ensure_relay_section() {
 	local section
 
 	section="$(relay_section_name "$device")"
-	ACTIVE_INTERFACES="${ACTIVE_INTERFACES}${device} "
 
-	if [ "$GLOBAL_AUTO_CREATE_RELAYS" -ne 1 ] && [ -z "$(uci -q get "$CONFIG_FILE.$section" 2>/dev/null)" ]; then
-		return 0
-	fi
+	# Discovery creates defaults once; existing sections belong to the user.
+	[ "$GLOBAL_AUTO_CREATE_RELAYS" -eq 1 ] || return 0
+	[ -z "$(uci -q get "$CONFIG_FILE.$section" 2>/dev/null)" ] || return 0
 
 	uci_set_if_changed "$CONFIG_FILE.$section" relay
 	uci_set_if_changed "$CONFIG_FILE.$section.interface" "$device"
@@ -107,10 +157,19 @@ ensure_relay_section() {
 	fi
 
 	if [ -z "$(uci -q get "$CONFIG_FILE.$section.database" 2>/dev/null)" ]; then
-		uci -q set "$CONFIG_FILE.$section.database=$(default_database_path "$device")"
+		uci -q set "$CONFIG_FILE.$section.database=$(default_database_path "$section")"
 		mark_changed
 	fi
 
+}
+
+mark_interface_available() {
+	local device="$1"
+
+	case "$AVAILABLE_INTERFACES" in
+		*" $device "*) ;;
+		*) AVAILABLE_INTERFACES="${AVAILABLE_INTERFACES}${device} " ;;
+	esac
 }
 
 process_detected_uplinks() {
@@ -146,6 +205,8 @@ process_detected_uplinks() {
 			continue
 		fi
 
+		mark_interface_available "$l3_device"
+
 		has_default=0
 		if json_select route 2>/dev/null; then
 			json_get_keys routes
@@ -164,7 +225,7 @@ process_detected_uplinks() {
 			json_select ..
 		fi
 
-		if [ "$has_default" -eq 1 ]; then
+		if [ "$has_default" -eq 1 ] || is_policy_routed_uplink "$l3_device" "$proto"; then
 			networks="$name"
 			detected_label="$(get_label_for_interface "$l3_device" "$networks" "$proto")"
 			ensure_relay_section "$l3_device" "$detected_label"

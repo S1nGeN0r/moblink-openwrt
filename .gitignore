@@ -4,6 +4,8 @@ staging_dir/
 tmp/
 bin/
 *.ipk
+*.apk
 sdk/
 artifacts/
 release-assets/
+.local-notes/

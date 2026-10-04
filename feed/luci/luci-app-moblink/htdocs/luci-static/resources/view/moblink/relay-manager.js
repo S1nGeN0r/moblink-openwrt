@@ -3,12 +3,14 @@
 'require fs';
 'require network';
 'require poll';
+'require rpc';
 'require uci';
 'require view';
 
 var GLOBAL_SETTINGS_COLLAPSED_KEY = 'moblink.relayManager.globalSettingsCollapsed';
 var GLOBAL_SETTINGS_NODE_ID = 'cbi-moblink-relay-service-globals';
 var RUNTIME_POLL_INTERVAL = 5;
+var callSystemInfo = rpc.declare({ object: 'system', method: 'info', expect: { '': {} } });
 
 function addLogLevelOption(section, optionName) {
 	var o = section.option(form.ListValue, optionName || 'log_level', _('Log level'));
@@ -20,7 +22,17 @@ function addLogLevelOption(section, optionName) {
 	o.default = 'info';
 }
 
-function collectUplinkCandidates(networks) {
+function isPolicyRoutedUplink(device, proto) {
+	return /^(?:modem|ppp|rmnet|wwan|wwp)/i.test(String(device || '')) ||
+		/^(?:3g|mbim|modemmanager|ncm|ppp|qmi)$/i.test(String(proto || ''));
+}
+
+function isVpnUplink(device, proto) {
+	return /^(?:wg|awg|tun|tap|tailscale|zt)/i.test(String(device || '')) ||
+		/^(?:wg.*|wireguard|amneziawg|.*vpn.*|tailscale)$/i.test(String(proto || ''));
+}
+
+function collectAvailableInterfaces(networks, excludeVpnUplinks) {
 	var candidates = [];
 	var seen = {};
 
@@ -30,17 +42,19 @@ function collectUplinkCandidates(networks) {
 
 		var l3Device = net.getL3Device ? net.getL3Device() : null;
 		var device = l3Device ? l3Device.getName() : net.getIfname();
+		var proto = net.getProtocol ? net.getProtocol() : '';
 		var hasDefaultRoute = !!(net.getGatewayAddr && net.getGatewayAddr()) ||
 			!!(net.getGateway6Addr && net.getGateway6Addr());
 
 		if (!device || device === 'lo')
 			return;
 
-		if (!hasDefaultRoute)
+		if (excludeVpnUplinks && isVpnUplink(device, proto))
 			return;
 
 		if (!seen[device]) {
 			seen[device] = {
+				autoEligible: false,
 				device: device,
 				networks: [],
 				proto: ''
@@ -49,8 +63,10 @@ function collectUplinkCandidates(networks) {
 		}
 
 		seen[device].networks.push(net.getName());
-		if (net.getProtocol && !seen[device].proto)
-			seen[device].proto = net.getProtocol();
+		seen[device].autoEligible = seen[device].autoEligible ||
+			hasDefaultRoute || isPolicyRoutedUplink(device, proto);
+		if (!seen[device].proto)
+			seen[device].proto = proto;
 	});
 
 	candidates.sort(function(a, b) {
@@ -69,6 +85,9 @@ function buildCandidateLabel(candidate) {
 	if (candidate.proto && !/^dhcpv?6?$/.test(candidate.proto) && details.indexOf(candidate.proto) === -1)
 		details.push(candidate.proto);
 
+	if (!candidate.autoEligible)
+		details.push(_('manual only'));
+
 	return details.length ? '%s (%s)'.format(candidate.device, details.join('; ')) : candidate.device;
 }
 
@@ -82,6 +101,33 @@ function candidateMap(candidates) {
 	return map;
 }
 
+function relayInterfaceChoices(candidates, config) {
+	var choices = [];
+	var seen = {};
+
+	(candidates || []).forEach(function(candidate) {
+		seen[candidate.device] = true;
+		choices.push({
+			label: buildCandidateLabel(candidate),
+			value: candidate.device
+		});
+	});
+
+	relaySections(config).forEach(function(section_id) {
+		var device = (config[section_id] || {}).interface;
+
+		if (device && !seen[device]) {
+			seen[device] = true;
+			choices.push({
+				label: _('%s (currently unavailable)').format(device),
+				value: device
+			});
+		}
+	});
+
+	return choices;
+}
+
 function buildConfigModel() {
 	var model = {};
 
@@ -90,6 +136,12 @@ function buildConfigModel() {
 	});
 
 	return model;
+}
+
+function relayConfigValue(section_id, option, fallback) {
+	var value = uci.get('moblink-relay-service', section_id, option);
+
+	return value == null || value === '' ? fallback : value;
 }
 
 function relaySections(config) {
@@ -109,6 +161,10 @@ function sanitizeName(value) {
 
 function runtimeStatusPath(section_id) {
 	return '/tmp/moblink-relay-status/%s.json'.format(sanitizeName(section_id));
+}
+
+function defaultRelayDatabase(section_id) {
+	return '/etc/moblink-relay-%s.json'.format(sanitizeName(section_id));
 }
 
 function loadRelayStatuses(config) {
@@ -139,84 +195,52 @@ function loadRelayStatuses(config) {
 	});
 }
 
-function loadConntrack() {
-	return L.resolveDefault(fs.read('/proc/net/nf_conntrack'), null).then(function(raw) {
-		if (raw)
-			return raw;
-
-		return L.resolveDefault(fs.read('/proc/net/ip_conntrack'), '');
-	});
-}
-
-function relayHasActiveUplink(section, candidatesByDevice) {
-	return !!(section && section.interface && candidatesByDevice[section.interface]);
-}
-
-function conntrackHasHost(tokens, host) {
-	for (var i = 0; i < tokens.length; i++) {
-		if (tokens[i] === 'src=' + host || tokens[i] === 'dst=' + host)
-			return true;
-	}
-
-	return false;
-}
-
-function hasStreamerConnection(conntrack, host) {
-	var lines = String(conntrack || '').split(/\n/);
-
-	if (!host)
-		return null;
-
-	if (!conntrack)
-		return null;
-
-	for (var i = 0; i < lines.length; i++) {
-		var line = lines[i];
-
-		if (!/(^|\s)tcp(\s|$)/.test(line) || line.indexOf('ESTABLISHED') === -1)
-			continue;
-
-		var tokens = line.split(/\s+/);
-
-		if (conntrackHasHost(tokens, host))
-			return true;
-	}
-
-	return false;
-}
-
-function relayRuntimeDetails(section_id, isActive, statuses, conntrack) {
+function relayRuntimeDetails(section_id, isActive, statuses, routerUptime, config) {
+	var section = (config || {})[section_id] || {};
+	var globals = (config || {}).globals || {};
 	var status = statuses[section_id] || null;
-	var relays = status && Array.isArray(status.relays) ? status.relays : [];
-	var streamerHost = relays.length ? relays[0].streamer_host : '';
-	var streamerConnected = hasStreamerConnection(conntrack, streamerHost);
+	var result = { connection: _('waiting for streamer'), streamerIp: '-', status: _('active') };
 
+	if (String(globals.enabled || '0') !== '1' || String(section.enabled == null ? '1' : section.enabled) !== '1')
+		return { connection: _('disabled'), streamerIp: '-', status: _('disabled') };
 	if (!isActive)
-		return {
-			connection: _('inactive'),
-			streamerIp: '-',
-			status: _('inactive')
-		};
-
+		return { connection: _('inactive'), streamerIp: '-', status: _('inactive') };
 	if (!status)
-		return {
-			connection: _('waiting for streamer'),
-			streamerIp: '-',
-			status: _('active')
-		};
+		return result;
+	if (status.schema_version !== 2 || !Number.isFinite(routerUptime) ||
+		!Number.isFinite(status.updated_uptime) || status.updated_uptime <= 0 ||
+		routerUptime - status.updated_uptime > 15 || status.updated_uptime - routerUptime > 5) {
+		result.connection = _('status unavailable');
+		return result;
+	}
 
-	if ((status.connected === true || status.connected === 1) && streamerConnected !== false)
-		return {
-			connection: streamerHost ? _('connected (%s)').format(streamerHost) : _('connected'),
-			streamerIp: streamerHost || '-',
-			status: _('active')
-		};
+	var relays = Array.isArray(status.relays) ? status.relays : [];
+	var connected = relays.filter(function(relay) { return relay.connected === true; });
+	if (connected.length) {
+		var peers = connected.map(function(relay) { return relay.streamer_ip || relay.streamer_host || ''; })
+			.filter(function(peer, index, peers) { return peer && peers.indexOf(peer) === index; });
+		result.streamerIp = peers.join(', ') || '-';
+		result.connection = peers.length ? _('connected (%s)').format(peers.join(', ')) : _('connected');
+	}
+	else if (relays.some(function(relay) { return relay.wrong_password === true; })) {
+		result.connection = _('wrong password');
+	}
+	else if (relays.length) {
+		result.connection = _('connecting');
+	}
+	return result;
+}
 
-	return {
-		connection: _('waiting for streamer'),
-		streamerIp: streamerHost || '-',
-		status: _('active')
-	};
+function validateStreamerUrl(value) {
+	if (!value)
+		return _('Enter a WebSocket URL for manual mode');
+	try {
+		var url = new URL(value);
+		if (url.protocol === 'ws:' && url.hostname && !url.username && !url.password && !url.hash &&
+			!/\s/.test(value))
+			return true;
+	} catch (e) {}
+	return _('Enter a ws:// URL without credentials or fragments');
 }
 
 function storageGet(key) {
@@ -311,48 +335,63 @@ function enableCollapsibleSections(root) {
 	});
 }
 
-function runtimeValue(section_id, field, isActive, statuses, conntrack) {
-	var details = relayRuntimeDetails(section_id, isActive, statuses, conntrack);
-
-	return details[field] || '-';
+function runtimeValue(section_id, field, isActive, statuses, routerUptime, config) {
+	return relayRuntimeDetails(section_id, isActive, statuses, routerUptime, config)[field] || '-';
 }
 
-function runtimeSpan(section_id, field, isActive, statuses, conntrack) {
+function runtimeSpan(section_id, field, isActive, statuses, routerUptime, config) {
 	return E('span', {
 		'data-moblink-runtime-section': section_id,
-		'data-moblink-runtime-field': field,
-		'data-moblink-runtime-active': isActive ? '1' : '0'
-	}, runtimeValue(section_id, field, isActive, statuses, conntrack));
+		'data-moblink-runtime-field': field
+	}, runtimeValue(section_id, field, isActive, statuses, routerUptime, config));
 }
 
-function updateRuntimeFields(root, config) {
+function updateRuntimeFields(root) {
+	var config = buildConfigModel();
 	return Promise.all([
 		loadRelayStatuses(config),
-		loadConntrack()
+		L.resolveDefault(callSystemInfo(), {}),
+		L.resolveDefault(network.flushCache().then(function() { return network.getNetworks(); }), [])
 	]).then(function(data) {
-		var statuses = data[0] || {};
-		var conntrack = data[1] || '';
+		var excludeVpn = String((config.globals || {}).exclude_vpn_uplinks || '0') === '1';
+		var available = candidateMap(collectAvailableInterfaces(data[2], excludeVpn));
 		var nodes = root ? root.querySelectorAll('[data-moblink-runtime-section]') : [];
 
 		for (var i = 0; i < nodes.length; i++) {
 			var node = nodes[i];
 			var section_id = node.getAttribute('data-moblink-runtime-section');
 			var field = node.getAttribute('data-moblink-runtime-field');
-			var isActive = node.getAttribute('data-moblink-runtime-active') === '1';
-
-			node.textContent = runtimeValue(section_id, field, isActive, statuses, conntrack);
+			var section = config[section_id] || {};
+			node.textContent = runtimeValue(section_id, field, !!available[section.interface],
+				data[0] || {}, Number(data[1].uptime), config);
 		}
 	});
 }
 
-function startRuntimePoll(root, config) {
+function startRuntimePoll(root) {
 	if (!root || root.getAttribute('data-moblink-runtime-poll') === '1')
 		return;
-
 	root.setAttribute('data-moblink-runtime-poll', '1');
-	poll.add(function() {
-		return updateRuntimeFields(root, config);
-	}, RUNTIME_POLL_INTERVAL);
+	var callback = function() {
+		if (!root.isConnected) {
+			poll.remove(callback);
+			root.removeAttribute('data-moblink-runtime-poll');
+			return;
+		}
+		return updateRuntimeFields(root);
+	};
+	poll.add(callback, RUNTIME_POLL_INTERVAL);
+}
+
+function attachRuntimeLifecycle(map) {
+	var renderContents = map.renderContents;
+	map.renderContents = function() {
+		return Promise.resolve(renderContents.apply(this, arguments)).then(function(root) {
+			enableCollapsibleSections(root);
+			startRuntimePoll(root);
+			return updateRuntimeFields(root).then(function() { return root; });
+		});
+	};
 }
 
 function addRelayGrid(m, options) {
@@ -360,38 +399,46 @@ function addRelayGrid(m, options) {
 
 	s = m.section(form.GridSection, 'relay', options.title, options.description);
 	s.anonymous = true;
-	s.addremove = false;
+	s.addremove = !!options.addremove;
 	s.nodescriptions = true;
 	s.sortable = false;
 	s.modaltitle = options.modalTitle;
 	s.sectiontitle = function(section_id) {
-		var section = options.config[section_id] || {};
-		var iface = section.interface || section_id;
-		var label = section.custom_label || section.detected_label || iface;
+		var iface = relayConfigValue(section_id, 'interface', section_id);
+		var label = relayConfigValue(section_id, 'custom_label', '') ||
+			relayConfigValue(section_id, 'detected_label', '') || iface;
 
 		return '%s -> %s'.format(iface, label);
 	};
-	s.cfgsections = function() {
-		return options.sections;
+	s.filter = function(section_id) {
+		var device = relayConfigValue(section_id, 'interface', '');
+		var active = !!options.candidatesByDevice[device];
+
+		return active === options.active && (active || showInactiveRelays(buildConfigModel()));
 	};
 
 	o = s.option(form.Flag, 'enabled', _('Enabled'));
 	o.rmempty = false;
+	o.default = '1';
 
-	o = s.option(form.DummyValue, 'interface', _('Interface'));
-	o.cfgvalue = function(section_id) {
-		return (options.config[section_id] || {}).interface || '-';
+	o = s.option(form.ListValue, 'interface', _('Interface'));
+	(options.interfaceChoices || []).forEach(function(choice) {
+		o.value(choice.value, choice.label);
+	});
+	o.rmempty = false;
+	o.validate = function(section_id, value) {
+		return value ? true : _('Select an uplink interface');
 	};
 
 	o = s.option(form.DummyValue, '_detected_label', _('Detected as'));
 	o.cfgvalue = function(section_id) {
-		var section = options.config[section_id] || {};
-		var candidate = options.candidatesByDevice[section.interface || ''];
+		var device = relayConfigValue(section_id, 'interface', '');
+		var candidate = options.candidatesByDevice[device];
 
 		if (candidate)
 			return buildCandidateLabel(candidate);
 
-		return section.detected_label || '-';
+		return relayConfigValue(section_id, 'detected_label', '-');
 	};
 
 	o = s.option(form.Value, 'custom_label', _('Relay label'));
@@ -402,7 +449,7 @@ function addRelayGrid(m, options) {
 	o.value('manual', _('Manual URL'));
 	o.rmempty = false;
 	o.cfgvalue = function(section_id) {
-		return String((options.config[section_id] || {}).use_manual_streamer_url || '0') === '1'
+		return String(relayConfigValue(section_id, 'use_manual_streamer_url', '0')) === '1'
 			? 'manual'
 			: 'auto';
 	};
@@ -412,32 +459,50 @@ function addRelayGrid(m, options) {
 	};
 
 	o = s.option(form.Value, 'streamer_url', _('Manual streamer URL'));
-	o.rmempty = true;
+	o.placeholder = 'ws://streamer.lan:7777';
+	o.rmempty = false;
+	o.retain = true;
 	o.depends('_streamer_mode', 'manual');
+	o.description = _('DNS hostnames are supported and avoid coupling a relay to a changing client IP address.');
+	o.validate = function(section_id, value) {
+		var mode = this.section.formvalue(section_id, '_streamer_mode');
+
+		return mode === 'manual' ? validateStreamerUrl(value) : true;
+	};
 
 	o = s.option(form.Value, 'password', _('Password'));
 	o.password = true;
 	o.rmempty = false;
 	o.placeholder = (options.config.globals || {}).default_password || '1234';
+	o.cfgvalue = function(section_id) {
+		return relayConfigValue(section_id, 'password',
+			relayConfigValue('globals', 'default_password', '1234'));
+	};
 
 	o = s.option(form.Value, 'database', _('Identity database'));
 	o.rmempty = false;
-	o.placeholder = options.databasePlaceholder;
+	o.cfgvalue = function(section_id) {
+		return relayConfigValue(section_id, 'database', defaultRelayDatabase(section_id));
+	};
 
 	o = s.option(form.DummyValue, '_connection', _('Connection'));
 	o.cfgvalue = function(section_id) {
-		return runtimeSpan(section_id, 'connection', options.active, options.runtimeStatuses, options.conntrack);
+		return runtimeSpan(section_id, 'connection', options.active, options.runtimeStatuses, options.routerUptime, buildConfigModel());
 	};
+	// GridSection uses textvalue(), whose default would stringify the live DOM node.
+	o.textvalue = o.cfgvalue;
 
 	o = s.option(form.DummyValue, '_streamer_ip', _('Streamer IP'));
 	o.cfgvalue = function(section_id) {
-		return runtimeSpan(section_id, 'streamerIp', options.active, options.runtimeStatuses, options.conntrack);
+		return runtimeSpan(section_id, 'streamerIp', options.active, options.runtimeStatuses, options.routerUptime, buildConfigModel());
 	};
+	o.textvalue = o.cfgvalue;
 
 	o = s.option(form.DummyValue, '_status', _('Status'));
 	o.cfgvalue = function(section_id) {
-		return runtimeSpan(section_id, 'status', options.active, options.runtimeStatuses, options.conntrack);
+		return runtimeSpan(section_id, 'status', options.active, options.runtimeStatuses, options.routerUptime, buildConfigModel());
 	};
+	o.textvalue = o.cfgvalue;
 }
 
 return view.extend({
@@ -448,7 +513,7 @@ return view.extend({
 			return Promise.all([
 				network.getNetworks(),
 				loadRelayStatuses(config),
-				loadConntrack()
+				L.resolveDefault(callSystemInfo(), {})
 			]);
 		});
 	},
@@ -457,16 +522,11 @@ return view.extend({
 		var config = buildConfigModel();
 		var networks = Array.isArray(data && data[0]) ? data[0] : [];
 		var runtimeStatuses = data && data[1] ? data[1] : {};
-		var conntrack = data && data[2] ? data[2] : '';
-		var candidates = collectUplinkCandidates(networks);
+		var routerUptime = Number(data && data[2] ? data[2].uptime : NaN);
+		var excludeVpnUplinks = String((config.globals || {}).exclude_vpn_uplinks || '0') === '1';
+		var candidates = collectAvailableInterfaces(networks, excludeVpnUplinks);
 		var candidatesByDevice = candidateMap(candidates);
-		var allRelaySections = relaySections(config);
-		var activeRelaySections = allRelaySections.filter(function(name) {
-			return relayHasActiveUplink(config[name] || {}, candidatesByDevice);
-		});
-		var inactiveRelaySections = allRelaySections.filter(function(name) {
-			return !relayHasActiveUplink(config[name] || {}, candidatesByDevice);
-		});
+		var interfaceChoices = relayInterfaceChoices(candidates, config);
 		var m, s, o;
 
 			m = new form.Map('moblink-relay-service', _('Moblink Relay Manager'),
@@ -479,7 +539,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Flag, 'auto_create_relays', _('Auto-create relays for available uplinks'),
-			_('Automatically create one relay section per active interface that currently exposes a usable default route, including backup or fallback links.'));
+			_('Automatically create one relay section per default-route uplink or active policy-routed modem interface.'));
 		o.default = '1';
 		o.rmempty = false;
 
@@ -513,37 +573,35 @@ return view.extend({
 			o.placeholder = 'tailscale.*';
 
 		addRelayGrid(m, {
+			addremove: true,
 			active: true,
 			candidatesByDevice: candidatesByDevice,
 			config: config,
-			conntrack: conntrack,
-			databasePlaceholder: '/etc/moblink-relay.json',
+			routerUptime: routerUptime,
+			interfaceChoices: interfaceChoices,
 			description: candidates.length
-				? _('One running relay process will be started for each active enabled relay section and can use backup links even when the router itself prefers another WAN.')
+				? _('Each enabled relay section starts an independent process. Multiple relays may intentionally share one uplink interface.')
 				: _('No active relay uplinks are detected right now. Existing relay sections remain stored below when enabled.'),
 			modalTitle: _('Relay settings'),
 			runtimeStatuses: runtimeStatuses,
-			sections: activeRelaySections,
 			title: _('Active relays')
 		});
 
 		addRelayGrid(m, {
+			addremove: false,
 			active: false,
 			candidatesByDevice: candidatesByDevice,
 			config: config,
-			conntrack: conntrack,
-			databasePlaceholder: '/etc/moblink-relay.json',
-			description: _('Stored relay sections that currently have no default-route uplink. Enable "Show inactive relays" above to display them.'),
+			routerUptime: routerUptime,
+			interfaceChoices: interfaceChoices,
+			description: _('Stored relay sections whose uplink is currently unavailable. Enable "Show inactive relays" above to display them.'),
 			modalTitle: _('Inactive relay settings'),
 			runtimeStatuses: runtimeStatuses,
-			sections: showInactiveRelays(config) ? inactiveRelaySections : [],
+			visible: showInactiveRelays(config),
 			title: _('Inactive relays')
 		});
 
-			return m.render().then(function(node) {
-				enableCollapsibleSections(node);
-				startRuntimePoll(node, config);
-				return node;
-			});
+			attachRuntimeLifecycle(m);
+			return m.render();
 	}
 });
